@@ -1,0 +1,79 @@
+#!/bin/bash
+set -eo pipefail
+
+# Trap to clean up background processes
+trap 'kill $(jobs -p) 2>/dev/null; exit' SIGINT SIGTERM
+
+nodes=$(oc get nodes -o jsonpath='{.items[*].metadata.name}')
+current_node=""
+
+cleanup() {
+    if [ -n "$current_node" ]; then
+        echo "Cleaning up $current_node"
+        oc adm uncordon "$current_node" --force >/dev/null 2>&1 || true
+    fi
+}
+trap cleanup EXIT
+
+for node in $nodes; do
+    current_node="$node"
+    echo -e "\nProcessing node: $node"
+    
+    # Cordon the node
+    oc adm cordon "$node" || { echo "Failed to cordon $node"; exit 1; }
+    
+    # Force drain even with PDB violations
+    echo "Force draining node (ignoring PDB constraints)..."
+    drain_timeout=600  # 10 minutes
+    if timeout $drain_timeout oc adm drain "$node" \
+        --ignore-daemonsets \
+        --delete-local-data \
+        --force \
+        --disable-eviction \
+        --timeout=300s; then
+        echo "Force drain successful"
+    else
+        echo "Force drain failed or timed out"
+        oc adm uncordon "$node"
+        exit 1
+    fi
+    
+    # Background reboot process
+    (
+        oc debug node/"$node" -- /bin/sh -c 'chroot /host systemctl reboot' >/dev/null 2>&1
+    ) &
+    debug_pid=$!
+    
+    # Monitor reboot status
+    rebooted=false
+    for i in {1..30}; do
+        if ! kill -0 $debug_pid 2>/dev/null; then
+            rebooted=true
+            break
+        fi
+        sleep 10
+    done
+    
+    if ! $rebooted; then
+        echo "Reboot process hung, forcing continuation..."
+        kill $debug_pid 2>/dev/null || true
+    fi
+    
+    # Extended wait for node recovery
+    echo "Waiting for node readiness (up to 20 minutes)..."
+    if oc wait --for=condition=Ready node/"$node" --timeout=1200s; then
+        echo "Node $node recovered successfully"
+    else
+        echo "Node $node failed to recover"
+        exit 1
+    fi
+    
+    # Uncordon
+    oc adm uncordon "$node" || { echo "Failed to uncordon $node"; exit 1; }
+    
+    echo "Completed processing for $node"
+    current_node=""
+    sleep 30  # Cooldown period
+done
+
+echo "All nodes processed successfully"
