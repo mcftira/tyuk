@@ -15,6 +15,16 @@ cleanup() {
 }
 trap cleanup EXIT
 
+force_delete_pods() {
+    local node="$1"
+    echo "Force deleting remaining pods on $node"
+    oc get pods --all-namespaces --field-selector spec.nodeName="$node" -o jsonpath='{range .items[*]}{.metadata.namespace}{"/"}{.metadata.name}{"\n"}{end}' | \
+    while read -r pod; do
+        echo "Force deleting pod $pod"
+        oc delete pod -n "${pod%/*}" "${pod#*/}" --force --grace-period=0 || true
+    done
+}
+
 for node in $nodes; do
     current_node="$node"
     echo -e "\nProcessing node: $node"
@@ -22,20 +32,27 @@ for node in $nodes; do
     # Cordon the node
     oc adm cordon "$node" || { echo "Failed to cordon $node"; exit 1; }
     
-    # Force drain even with PDB violations
-    echo "Force draining node (ignoring PDB constraints)..."
-    drain_timeout=600  # 10 minutes
+    # Force drain with multiple strategies
+    echo "Force draining node (aggressive mode)..."
+    drain_timeout=900  # 15 minutes
     if timeout $drain_timeout oc adm drain "$node" \
         --ignore-daemonsets \
-        --delete-local-data \
+        --delete-emptydir-data \
         --force \
         --disable-eviction \
-        --timeout=300s; then
+        --grace-period=0 \
+        --timeout=600s; then
         echo "Force drain successful"
     else
-        echo "Force drain failed or timed out"
-        oc adm uncordon "$node"
-        exit 1
+        echo "Drain timed out - forcing remaining pod deletions"
+        force_delete_pods "$node"
+        sleep 30  # Wait for API to catch up
+    fi
+    
+    # Final verification of pod evacuation
+    remaining_pods=$(oc get pods --all-namespaces --field-selector spec.nodeName="$node" -o name | wc -l)
+    if [ "$remaining_pods" -gt 0 ]; then
+        echo "Warning: $remaining_pods pods remaining on node after drain"
     fi
     
     # Background reboot process
@@ -60,8 +77,8 @@ for node in $nodes; do
     fi
     
     # Extended wait for node recovery
-    echo "Waiting for node readiness (up to 20 minutes)..."
-    if oc wait --for=condition=Ready node/"$node" --timeout=1200s; then
+    echo "Waiting for node readiness (up to 30 minutes)..."
+    if oc wait --for=condition=Ready node/"$node" --timeout=1800s; then
         echo "Node $node recovered successfully"
     else
         echo "Node $node failed to recover"
@@ -73,7 +90,7 @@ for node in $nodes; do
     
     echo "Completed processing for $node"
     current_node=""
-    sleep 30  # Cooldown period
+    sleep 60  # Cooldown period
 done
 
 echo "All nodes processed successfully"
