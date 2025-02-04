@@ -1,0 +1,16 @@
+curl -X POST -H "Authorization: Bearer $ROX_API_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "reportConfig": {
+      "name": "-vuln-report",
+      "type": "VULNERABILITY",
+      "filter": {
+        "namespace": "",
+        "cluster": ""
+      },
+      "schedule": {
+        "intervalType": "ON_DEMAND"
+      }
+    }
+  }' \
+  "https://<CENTRAL_URL>/v1/report/configurations"
